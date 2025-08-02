@@ -9,3 +9,5 @@ for test run:
 for real fun:
 
 `main.exe 1000000000000000000 1ffffffffffffffffff 105b7f253f0ebd7843adaebbd805c944bfb863e4` - puzzle 73
+
+check commands.txt
