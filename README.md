@@ -1,5 +1,7 @@
 # GPU FULL RANDOM
 
+JUST STRAIGHT FULL RANDOM KEY GENERATION IN A RANGE
+
 for test run:
 
 `main.exe 1000000 1ffffff 2f396b29b27324300d0c59b17c3abc1835bd3dbb` - puzzle 25
