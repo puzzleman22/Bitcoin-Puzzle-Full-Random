@@ -10,6 +10,18 @@
 #pragma once
 #include <stdint.h>
 #include <curand_kernel.h>
+#include <chrono>
+#include <iostream>
+#include <fstream>
+#include <ctime>
+
+#define CHECK_CUDA(call) do { \
+    cudaError_t err = call; \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, "CUDA error in %s at line %d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+        exit(EXIT_FAILURE); \
+    } \
+} while(0)
 
 // Optimized rotate right for SHA-256
 __device__ inline uint32_t rotr(uint32_t x, uint32_t n) {
@@ -1265,17 +1277,20 @@ __device__ bool compare_hash160_fast_vectorized(const uint8_t* hash1, const uint
     return (h1.x == h2.x) && (h1.y == h2.y) && 
            (h1.z == h2.z) && (h1.w == h2.w) && (h1_tail == h2_tail);
 }
-__global__ void start_optimized(const char* minRangePure, const char* maxRangePure, const char* target) {
+// Optimized kernel using consecutive key generation
+__global__ void start_consecutive_optimized(
+    const char* minRangePure, 
+    const char* maxRangePure, 
+    const char* target,
+    uint64_t* global_counter)  // Global counter for work distribution
+{
     // Shared memory for frequently accessed data
     __shared__ uint8_t shared_target[20];
-    __shared__ BigInt shared_min, shared_max;
+    __shared__ BigInt shared_min, shared_max, shared_range;
+    __shared__ ECPointJac shared_G;  // Cache generator point
     
     // Initialize shared memory once per block
     if (threadIdx.x == 0) {
-        if (blockIdx.x == 0) {
-            printf("Starting search...\n");
-        }
-        
         // Parse min/max once per block
         char minRange[65], maxRange[65];
         leftPad64(minRange, minRangePure);
@@ -1283,126 +1298,239 @@ __global__ void start_optimized(const char* minRangePure, const char* maxRangePu
         hex_to_bigint(minRange, &shared_min);
         hex_to_bigint(maxRange, &shared_max);
         
+        // Calculate range for better work distribution
+        ptx_u256Sub(&shared_range, &shared_max, &shared_min);
+        
         // Parse target once per block
         hex_string_to_bytes(target, shared_target, 20);
+        
+        // Cache generator point
+        point_copy_jac(&shared_G, &const_G_jacobian);
+    }
+    __syncthreads();
+    
+
+    
+    // Each thread processes a consecutive chunk of keys
+    const int CONSECUTIVE_KEYS = 256;  // Process 256 consecutive keys per thread
+    
+    // Get unique starting position for this thread using atomic counter
+    uint64_t work_unit = atomicAdd(global_counter, CONSECUTIVE_KEYS);
+    
+    // Calculate starting private key for this thread
+    BigInt thread_start_key;
+    BigInt work_offset;
+    
+    // Simple method: start_key = min + (work_unit % range)
+    // This ensures we stay within range and each thread gets unique work
+    init_bigint(&work_offset, 0);
+    // For large offsets, you'd need proper BigInt arithmetic
+    // For now, using modulo to wrap around the range
+    for (int i = 0; i < 8 && i < BIGINT_WORDS; i++) {
+        work_offset.data[i] = (work_unit >> (i * 32)) & 0xFFFFFFFF;
+    }
+    
+    // Add offset to minimum value
+    BigInt temp;
+    ptx_u256Add(&temp, &shared_min, &work_offset);
+    
+    // Ensure we're within range
+    if (compare_bigint(&temp, &shared_max) > 0) {
+        // Wrap around if we exceed max
+        ptx_u256Sub(&thread_start_key, &temp, &shared_range);
+    } else {
+        copy_bigint(&thread_start_key, &temp);
+    }
+    
+    // Ensure within curve order
+    scalar_mod_n(&thread_start_key, &thread_start_key);
+    
+    // Compute initial public key for this thread's starting position
+    ECPointJac current_pubkey_jac;
+    scalar_multiply_jac_device(&current_pubkey_jac, &shared_G, &thread_start_key);
+    
+    // Working memory
+    ECPoint public_key;
+    uint8_t pubkey[33];
+    uint8_t hash160_out[20];
+    BigInt current_private_key;
+    copy_bigint(&current_private_key, &thread_start_key);
+    
+    // Process consecutive keys by adding G repeatedly
+    for (int k = 0; k < CONSECUTIVE_KEYS; k++) {
+        // For k > 0, add G to get next consecutive public key
+        if (k > 0) {
+            add_point_jac(&current_pubkey_jac, &current_pubkey_jac, &shared_G);
+            
+            // Increment private key
+            BigInt one;
+            init_bigint(&one, 1);
+            ptx_u256Add(&temp, &current_private_key, &one);
+            scalar_mod_n(&current_private_key, &temp);
+        }
+        
+        // Convert to affine coordinates
+        jacobian_to_affine(&public_key, &current_pubkey_jac);
+        
+        // Compress public key
+        coords_to_compressed_pubkey(public_key.x, public_key.y, pubkey);
+        
+        // Hash
+        hash160(pubkey, 33, hash160_out);
+        
+        // Fast comparison using 64-bit operations
+        uint64_t* hash64 = (uint64_t*)hash160_out;
+        uint64_t* target64 = (uint64_t*)shared_target;
+        uint32_t* hash32 = (uint32_t*)(hash160_out + 16);
+        uint32_t* target32 = (uint32_t*)(shared_target + 16);
+        
+        if (hash64[0] == target64[0] && 
+            hash64[1] == target64[1] && 
+            hash32[0] == target32[0]) {
+            
+            // Found match!
+            if (atomicCAS((int*)&g_found, 0, 1) == 0) {
+                // Convert to hex string
+                char binary[257];
+                bigint_to_binary(&current_private_key, binary);
+                char temp_hex[65];
+                binary_to_hex(binary, temp_hex);
+                
+                // Store in global memory
+                memcpy(g_found_hex, temp_hex, 65);
+            }
+            return;
+        }
+    }
+}
+
+// Alternative: Hybrid approach - random starting points with consecutive search
+__global__ void start_hybrid_optimized(
+    const char* minRangePure, 
+    const char* maxRangePure, 
+    const char* target)
+{
+    // Shared memory setup (same as before)
+    __shared__ uint8_t shared_target[20];
+    __shared__ BigInt shared_min, shared_max;
+    __shared__ ECPointJac shared_G;
+    
+    if (threadIdx.x == 0) {
+        char minRange[65], maxRange[65];
+        leftPad64(minRange, minRangePure);
+        leftPad64(maxRange, maxRangePure);
+        hex_to_bigint(minRange, &shared_min);
+        hex_to_bigint(maxRange, &shared_max);
+        hex_string_to_bytes(target, shared_target, 20);
+        point_copy_jac(&shared_G, &const_G_jacobian);
     }
     __syncthreads();
     
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     
-    // Fast RNG - use better mixing
+    // RNG for random starting points
     uint64_t rng_state = mix(clock64() ^ ((uint64_t)tid << 32) ^ ((uint64_t)blockIdx.x << 48));
     
-    // Process multiple keys per thread for better efficiency
-    const int KEYS_PER_THREAD = 16;
+    // Number of random starting points per thread
+    const int RANDOM_STARTS = 4;
+    // Number of consecutive keys to check from each random start
+    const int CONSECUTIVE_PER_START = 64;
     
-    // Allocate working memory once
-    BigInt random_value, priv;
-    ECPointJac result_jac;
+    BigInt random_base, current_private;
+    ECPointJac base_pubkey_jac, current_pubkey_jac;
     ECPoint public_key;
     uint8_t pubkey[33];
     uint8_t hash160_out[20];
     
-    // Remove all debug output from hot loop
-    uint32_t iterations = 0;
-    
-    while (!g_found) {
-        // Process batch of keys
-        for (int k = 0; k < KEYS_PER_THREAD; k++) {
-            // Generate random value
-            generate_random_bigint_range_optimized(&rng_state, &shared_min, &shared_max, &random_value);
-            
-            // Ensure within curve order (branchless)
-            int needs_reduction = (compare_bigint(&random_value, &const_n) >= 0);
-            if (needs_reduction) {
-                ptx_u256Sub(&priv, &random_value, &const_n);
-            } else {
-                copy_bigint(&priv, &random_value);
+    for (int r = 0; r < RANDOM_STARTS; r++) {
+        // Generate random starting point
+        generate_random_bigint_range_optimized(&rng_state, &shared_min, 
+                                              &shared_max, &random_base);
+        scalar_mod_n(&random_base, &random_base);
+        
+        // Compute public key for random base
+        scalar_multiply_jac_device(&base_pubkey_jac, &shared_G, &random_base);
+        point_copy_jac(&current_pubkey_jac, &base_pubkey_jac);
+        copy_bigint(&current_private, &random_base);
+        
+        // Search consecutive keys from this random starting point
+        for (int k = 0; k < CONSECUTIVE_PER_START; k++) {
+            if (k > 0) {
+                // Add G for next consecutive key
+                add_point_jac(&current_pubkey_jac, &current_pubkey_jac, &shared_G);
+                
+                // Increment private key
+                BigInt one;
+                init_bigint(&one, 1);
+                BigInt temp;
+                ptx_u256Add(&temp, &current_private, &one);
+                scalar_mod_n(&current_private, &temp);
             }
             
-            // Scalar multiplication
-            scalar_multiply_optimized(&result_jac, &const_G_jacobian, &priv);
-            jacobian_to_affine_fast(&public_key, &result_jac);
-            
-            // Compress public key
+            // Convert and check
+            jacobian_to_affine(&public_key, &current_pubkey_jac);
             coords_to_compressed_pubkey(public_key.x, public_key.y, pubkey);
-            
-            // Hash
             hash160(pubkey, 33, hash160_out);
             
-            // Fast comparison using 32-bit operations
-            uint32_t* hash32 = (uint32_t*)hash160_out;
-            uint32_t* target32 = (uint32_t*)shared_target;
+            // Fast comparison
+            uint64_t* hash64 = (uint64_t*)hash160_out;
+            uint64_t* target64 = (uint64_t*)shared_target;
+            uint32_t* hash32 = (uint32_t*)(hash160_out + 16);
+            uint32_t* target32 = (uint32_t*)(shared_target + 16);
             
-            int match = ((hash32[0] == target32[0]) & 
-                        (hash32[1] == target32[1]) & 
-                        (hash32[2] == target32[2]) & 
-                        (hash32[3] == target32[3]) & 
-                        (hash32[4] == target32[4]));
-            
-            if (match) {
-                // Only do expensive operations when we find a match
+            if (hash64[0] == target64[0] && 
+                hash64[1] == target64[1] && 
+                hash32[0] == target32[0]) {
+                
                 if (atomicCAS((int*)&g_found, 0, 1) == 0) {
-                    // Convert to strings only for the found key
                     char binary[257];
-                    bigint_to_binary(&random_value, binary);
-                    char temp_hex[65], hash160_str[41];
+                    bigint_to_binary(&current_private, binary);
+                    char temp_hex[65];
                     binary_to_hex(binary, temp_hex);
-                    hash160_to_hex(hash160_out, hash160_str);
-                    
                     memcpy(g_found_hex, temp_hex, 65);
-                    memcpy(g_found_hash160, hash160_str, 41);
-                    
-                    printf("\n*** FOUND! ***\n");
-                    printf("Private Key: %s\n", temp_hex);
-                    printf("Hash160: %s\n", hash160_str);
                 }
                 return;
             }
         }
-        
-        iterations += KEYS_PER_THREAD;
-        
-        if (tid == 0 && iterations % 1024 == 0) {
-            // Just report the rate, no string conversions
-            printf("Thread 0: %u iterations\n", iterations);
-        }
     }
 }
+
+// Modified main function to use consecutive search
 int main(int argc, char* argv[]) {
     if (argc < 4) {
-        std::cerr << "Usage: " << argv[0] << " (required <min> <max> <target>) (optional <blocks> <threads>)" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <min> <max> <target> [blocks] [threads] [device_id] [mode]" << std::endl;
+        std::cerr << "Modes: 0=random (original), 1=consecutive, 2=hybrid" << std::endl;
         return 1;
     }
     
     try {
-		
         int device_id = (argc >= 7) ? std::stoi(argv[6]) : 0;
-
-        // Check if device exists
+        int search_mode = (argc >= 8) ? std::stoi(argv[7]) : 0; // Default to consecutive
+        
+        // Device setup
         int device_count = 0;
         cudaGetDeviceCount(&device_count);
         if (device_id < 0 || device_id >= device_count) {
-            std::cerr << "Invalid device ID: " << device_id
-                      << ". Available devices: 0 to " << (device_count - 1) << std::endl;
+            std::cerr << "Invalid device ID: " << device_id << std::endl;
             return 1;
         }
-
-        // Set device
         cudaSetDevice(device_id);
-
         std::cout << "Using CUDA device " << device_id << std::endl;
-		initialize_secp256k1_gpu();
         
-        // Allocate device memory for 3 strings
+        const char* mode_names[] = {"Random", "Consecutive", "Hybrid"};
+        std::cout << "Search mode: " << mode_names[search_mode] << std::endl;
+        
+        // Initialize GPU constants
+        init_gpu_constants();
+        precompute_G_kernel<<<1, 1>>>();
+        cudaDeviceSynchronize();
+        
+        // Allocate and copy parameters to device
         char *d_param1, *d_param2, *d_param3;
-        
-        // Get string lengths
         size_t len1 = strlen(argv[1]) + 1;
         size_t len2 = strlen(argv[2]) + 1;
         size_t len3 = strlen(argv[3]) + 1;
         
-        // Allocate and copy in one operation each
         cudaMalloc(&d_param1, len1);
         cudaMemcpy(d_param1, argv[1], len1, cudaMemcpyHostToDevice);
         
@@ -1412,65 +1540,140 @@ int main(int argc, char* argv[]) {
         cudaMalloc(&d_param3, len3);
         cudaMemcpy(d_param3, argv[3], len3, cudaMemcpyHostToDevice);
         
-        // Parse grid configuration
-        int blocks = (argc >= 5) ? std::stoi(argv[4]) : 32;
-        int threads = (argc >= 6) ? std::stoi(argv[5]) : 32;
+        // Allocate global counter for consecutive mode
+        uint64_t* d_global_counter = nullptr;
+        if (search_mode == 1) {
+            cudaMalloc(&d_global_counter, sizeof(uint64_t));
+            cudaMemset(d_global_counter, 0, sizeof(uint64_t));
+        }
         
-        printf("Launching with %d blocks and %d threads\nTotal parallel threads: %d\n\n", 
+        // Parse grid configuration
+        int blocks = (argc >= 5) ? std::stoi(argv[4]) : 256;
+        int threads = (argc >= 6) ? std::stoi(argv[5]) : 256;
+        
+        printf("Launching %d blocks x %d threads = %d total threads\n", 
                blocks, threads, blocks * threads);
         
-        // Launch kernel
-        start_optimized<<<blocks, threads>>>(d_param1, d_param2, d_param3);
+        // Adjust keys per thread based on mode
+        uint64_t keys_per_thread;
+        switch(search_mode) {
+            case 0: keys_per_thread = 32; break;      // Original random
+            case 1: keys_per_thread = 256; break;     // Consecutive - more keys per thread
+            case 2: keys_per_thread = 4 * 64; break;  // Hybrid - 4 random starts × 64 consecutive
+        }
         
-        // Wait for completion
-        cudaDeviceSynchronize();
+        // Speed calculation variables
+        auto start_time = std::chrono::high_resolution_clock::now();
+        uint64_t total_iterations = 0;
+        uint64_t kernel_launches = 0;
         
-        // Check if solution was found
-        int found_flag;
-        cudaMemcpyFromSymbol(&found_flag, g_found, sizeof(int));
+        auto last_report_time = start_time;
+        uint64_t last_report_iterations = 0;
+        const int report_interval_seconds = 10;
         
-        if (found_flag) {
-            char found_hex[65];
-            char found_hash160[41];
+        while(true) {
+            // Launch appropriate kernel based on mode
+            switch(search_mode) {
+                case 0:
+                    start_consecutive_optimized<<<blocks, threads>>>(d_param1, d_param2, d_param3, d_global_counter);
+                    break;
+                case 1:
+                    start_consecutive_optimized<<<blocks, threads>>>(
+                        d_param1, d_param2, d_param3, d_global_counter);
+                    break;
+                case 2:
+                    start_hybrid_optimized<<<blocks, threads>>>(
+                        d_param1, d_param2, d_param3);
+                    break;
+            }
             
-            // Copy results from device
-            cudaMemcpyFromSymbol(found_hex, g_found_hex, 65);
-            cudaMemcpyFromSymbol(found_hash160, g_found_hash160, 41);
+            cudaDeviceSynchronize();
+            kernel_launches++;
             
-            // Save to file with timestamp
-            std::ofstream outfile("result.txt", std::ios::app);
-            if (outfile.is_open()) {
-                std::time_t now = std::time(nullptr);
-                char timestamp[100];
-                std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", 
-                             std::localtime(&now));
+            uint64_t iterations_this_launch = blocks * threads * keys_per_thread;
+            total_iterations += iterations_this_launch;
+            
+            // Check if solution was found
+            int found_flag;
+            cudaMemcpyFromSymbol(&found_flag, g_found, sizeof(int));
+            
+            // Calculate and report speed periodically
+            auto current_time = std::chrono::high_resolution_clock::now();
+            auto time_since_report = std::chrono::duration_cast<std::chrono::seconds>(
+                current_time - last_report_time).count();
+            
+            if (time_since_report >= report_interval_seconds) {
+                uint64_t iterations_since_report = total_iterations - last_report_iterations;
+                double speed = iterations_since_report / static_cast<double>(time_since_report);
                 
-                outfile << "[" << timestamp << "] Found: " << found_hex 
-                       << " -> " << found_hash160 << std::endl;
-                outfile.close();
-                std::cout << "Result appended to result.txt" << std::endl;
-            } else {
-                std::cerr << "Unable to open file for writing" << std::endl;
+                if (speed >= 1e9) {
+                    printf("[%s] Speed: %.2f GKeys/s", mode_names[search_mode], speed / 1e9);
+                } else if (speed >= 1e6) {
+                    printf("[%s] Speed: %.2f MKeys/s", mode_names[search_mode], speed / 1e6);
+                } else if (speed >= 1e3) {
+                    printf("[%s] Speed: %.2f KKeys/s", mode_names[search_mode], speed / 1e3);
+                } else {
+                    printf("[%s] Speed: %.2f Keys/s", mode_names[search_mode], speed);
+                }
+                
+                auto total_time = std::chrono::duration_cast<std::chrono::seconds>(
+                    current_time - start_time).count();
+                printf(" | Total: %.2fG keys in %ld seconds | Kernel launches: %lu\n", 
+                       total_iterations / 1e9, total_time, kernel_launches);
+                
+                last_report_time = current_time;
+                last_report_iterations = total_iterations;
+            }
+            
+            if (found_flag) {
+                auto end_time = std::chrono::high_resolution_clock::now();
+                auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    end_time - start_time).count();
+                double total_seconds = total_duration / 1000.0;
+                double average_speed = total_iterations / total_seconds;
+                
+                char found_hex[65];
+                cudaMemcpyFromSymbol(found_hex, g_found_hex, 65);
+                
+                printf("\n*** FOUND! ***\n");
+                printf("Private Key: %s\n", found_hex);
+                printf("Search Mode: %s\n", mode_names[search_mode]);
+                printf("Total time: %.2f seconds\n", total_seconds);
+                printf("Total iterations: %lu\n", total_iterations);
+                printf("Average speed: %.2f MKeys/s\n", average_speed / 1e6);
+                printf("Kernel launches: %lu\n", kernel_launches);
+                
+                std::ofstream outfile("result.txt", std::ios::app);
+                if (outfile.is_open()) {
+                    std::time_t now = std::time(nullptr);
+                    char timestamp[100];
+                    std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", 
+                                 std::localtime(&now));
+                    outfile << "[" << timestamp << "] " << found_hex 
+                            << " | Mode: " << mode_names[search_mode]
+                            << " | Time: " << total_seconds << "s"
+                            << " | Speed: " << (average_speed / 1e6) << " MKeys/s"
+                            << std::endl;
+                    outfile.close();
+                }
+                break;
             }
         }
         
-        // Check for CUDA errors
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            std::cerr << "CUDA error: " << cudaGetErrorString(err) << std::endl;
-            cudaFree(d_param1);
-            cudaFree(d_param2);
-            cudaFree(d_param3);
-            return 1;
-        }
-        
-        // Clean up
+        // Cleanup
         cudaFree(d_param1);
         cudaFree(d_param2);
         cudaFree(d_param3);
+        if (d_global_counter) cudaFree(d_global_counter);
+        
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            std::cerr << "CUDA error: " << cudaGetErrorString(err) << std::endl;
+            return 1;
+        }
         
     } catch (const std::exception& e) {
-        std::cerr << "An error occurred: " << e.what() << std::endl;
+        std::cerr << "Error: " << e.what() << std::endl;
         cudaDeviceReset();
         return 1;
     }

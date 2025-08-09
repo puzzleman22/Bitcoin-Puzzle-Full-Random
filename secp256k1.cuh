@@ -1,26 +1,9 @@
-//Author telegram: https://t.me/nmn5436
-
-#ifndef SECP256K1_CUH
-#define SECP256K1_CUH
 #include <iostream>
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <string.h>
 
 #define BIGINT_WORDS 8
-
-// Precomputation settings
-#define PRECOMP_BITS 8
-#define PRECOMP_SIZE (1 << PRECOMP_BITS)  // 256 points
-#define WINDOW_SIZE 4  // For general scalar multiplication
-
-#define CHECK_CUDA(call) do { \
-    cudaError_t err = call; \
-    if (err != cudaSuccess) { \
-        fprintf(stderr, "CUDA error in %s at line %d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
-        exit(EXIT_FAILURE); \
-    } \
-} while(0)
 
 struct BigInt {
     uint32_t data[BIGINT_WORDS];
@@ -36,16 +19,14 @@ struct ECPointJac {
     bool infinity;
 };
 
-// Constants
 __constant__ BigInt const_p;
 __constant__ ECPointJac const_G_jacobian;
 __constant__ BigInt const_n;
 
-// Precomputed table for base point G
-__device__ ECPointJac *d_precomp_G = nullptr;
+#define WINDOW_SIZE 16
+__device__ ECPointJac G_precomp[1 << WINDOW_SIZE];
 
-// Host function to initialize precomputed table
-void init_precomputed_table_host();
+
 
 __host__ __device__ __forceinline__ void init_bigint(BigInt *x, uint32_t val) {
     x->data[0] = val;
@@ -53,12 +34,14 @@ __host__ __device__ __forceinline__ void init_bigint(BigInt *x, uint32_t val) {
 }
 
 __host__ __device__ __forceinline__ void copy_bigint(BigInt *dest, const BigInt *src) {
+	#pragma unroll
     for (int i = 0; i < BIGINT_WORDS; i++) {
         dest->data[i] = src->data[i];
     }
 }
 
 __host__ __device__ __forceinline__ int compare_bigint(const BigInt *a, const BigInt *b) {
+	#pragma unroll
     for (int i = BIGINT_WORDS - 1; i >= 0; i--) {
         if (a->data[i] > b->data[i]) return 1;
         if (a->data[i] < b->data[i]) return -1;
@@ -67,6 +50,7 @@ __host__ __device__ __forceinline__ int compare_bigint(const BigInt *a, const Bi
 }
 
 __host__ __device__ __forceinline__ bool is_zero(const BigInt *a) {
+	#pragma unroll
     for (int i = 0; i < BIGINT_WORDS; i++) {
         if (a->data[i]) return false;
     }
@@ -120,15 +104,22 @@ __device__ __forceinline__ void ptx_u256Sub(BigInt *res, const BigInt *a, const 
 
 // Optimized multiply_bigint_by_const with unrolling
 __device__ __forceinline__ void multiply_bigint_by_const(const BigInt *a, uint32_t c, uint32_t result[9]) {
-    uint64_t carry = 0;
-    
+    uint32_t carry = 0;
     #pragma unroll
     for (int i = 0; i < BIGINT_WORDS; i++) {
-        uint64_t prod = (uint64_t)a->data[i] * c + carry;
-        result[i] = (uint32_t)prod;
-        carry = prod >> 32;
+        uint32_t lo, hi;
+        asm volatile(
+            "mul.lo.u32 %0, %2, %3;\n\t"
+            "mul.hi.u32 %1, %2, %3;\n\t"
+            "add.cc.u32 %0, %0, %4;\n\t"
+            "addc.u32 %1, %1, 0;\n\t"
+            : "=r"(lo), "=r"(hi)
+            : "r"(a->data[i]), "r"(c), "r"(carry)
+        );
+        result[i] = lo;
+        carry = hi;
     }
-    result[8] = (uint32_t)carry;
+    result[8] = carry;
 }
 
 // Optimized shift_left_word
@@ -141,16 +132,25 @@ __device__ __forceinline__ void shift_left_word(const BigInt *a, uint32_t result
     }
 }
 
-// Optimized add_9word with unrolling
 __device__ __forceinline__ void add_9word(uint32_t r[9], const uint32_t addend[9]) {
-    uint64_t carry = 0;
-    
-    #pragma unroll
-    for (int i = 0; i < 9; i++) {
-        uint64_t sum = (uint64_t)r[i] + addend[i] + carry;
-        r[i] = (uint32_t)sum;
-        carry = sum >> 32;
-    }
+    // Use PTX add with carry chain for efficient 9-word addition
+    asm volatile(
+        "add.cc.u32 %0, %0, %9;\n\t"      // r[0] += addend[0], set carry
+        "addc.cc.u32 %1, %1, %10;\n\t"    // r[1] += addend[1] + carry, set carry
+        "addc.cc.u32 %2, %2, %11;\n\t"    // r[2] += addend[2] + carry, set carry
+        "addc.cc.u32 %3, %3, %12;\n\t"    // r[3] += addend[3] + carry, set carry
+        "addc.cc.u32 %4, %4, %13;\n\t"    // r[4] += addend[4] + carry, set carry
+        "addc.cc.u32 %5, %5, %14;\n\t"    // r[5] += addend[5] + carry, set carry
+        "addc.cc.u32 %6, %6, %15;\n\t"    // r[6] += addend[6] + carry, set carry
+        "addc.cc.u32 %7, %7, %16;\n\t"    // r[7] += addend[7] + carry, set carry
+        "addc.u32 %8, %8, %17;\n\t"       // r[8] += addend[8] + carry (no carry out needed)
+        : "+r"(r[0]), "+r"(r[1]), "+r"(r[2]), "+r"(r[3]), 
+          "+r"(r[4]), "+r"(r[5]), "+r"(r[6]), "+r"(r[7]), 
+          "+r"(r[8])
+        : "r"(addend[0]), "r"(addend[1]), "r"(addend[2]), "r"(addend[3]),
+          "r"(addend[4]), "r"(addend[5]), "r"(addend[6]), "r"(addend[7]),
+          "r"(addend[8])
+    );
 }
 
 __device__ __forceinline__ void convert_9word_to_bigint(const uint32_t r[9], BigInt *res) {
@@ -158,104 +158,117 @@ __device__ __forceinline__ void convert_9word_to_bigint(const uint32_t r[9], Big
         res->data[i] = r[i];
     }
 }
+
 __device__ __forceinline__ void mul_mod_device(BigInt *res, const BigInt *a, const BigInt *b) {
-    uint32_t prod[16] = {0};
+    // Keep EXACT multiplication code that works
+    uint64_t prod[16] = {0};
     
-    // Multiplication phase - optimized with better memory access patterns
+    // Optimize: Use shared memory for better cache locality if available
     #pragma unroll
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < BIGINT_WORDS; i++) {
         uint64_t carry = 0;
-        uint32_t ai = a->data[i];
+        uint32_t ai = a->data[i];  // Cache in register
         
-        // Use PTX for the inner loop multiplication
         #pragma unroll
-        for (int j = 0; j < 8; j++) {
-            uint64_t tmp = (uint64_t)prod[i + j] + (uint64_t)ai * b->data[j] + carry;
-            prod[i + j] = (uint32_t)tmp;
-            carry = tmp >> 32;
+        for (int j = 0; j < BIGINT_WORDS; j++) {
+            uint32_t lo, hi;
+            asm volatile(
+                "mul.lo.u32 %0, %2, %3;\n\t"
+                "mul.hi.u32 %1, %2, %3;\n\t"
+                : "=r"(lo), "=r"(hi)
+                : "r"(ai), "r"(b->data[j])  // Use cached value
+            );
+            uint64_t mul = ((uint64_t)hi << 32) | lo;
+            uint64_t sum = prod[i + j] + mul + carry;
+            prod[i + j] = (uint32_t)sum;
+            carry = sum >> 32;
         }
-        prod[i + 8] += (uint32_t)carry;
+        prod[i + BIGINT_WORDS] += carry;
     }
     
-    // Split into L and H
-    BigInt L, H;
+    // Convert to 32-bit array - keep exactly the same but unroll
+    uint32_t prod32[16];
     #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        L.data[i] = prod[i];
-        H.data[i] = prod[i + 8];
+    for (int i = 0; i < 16; i++) {
+        prod32[i] = (uint32_t)(prod[i] & 0xFFFFFFFFULL);
     }
     
-    // Initialize Rext with L
+    // Optimize: Combine L and H extraction with Rext initialization
     uint32_t Rext[9];
+    BigInt H;
+    
     #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        Rext[i] = L.data[i];
+    for (int i = 0; i < BIGINT_WORDS; i++) {
+        Rext[i] = prod32[i];  // L part goes directly to Rext
+        H.data[i] = prod32[i + BIGINT_WORDS];  // H part
     }
     Rext[8] = 0;
     
-    // Optimized: Add H * 977 and H * 2^32 in a single pass
-    uint64_t carry = 0;
-    
-    // For i=0: just add H[0] * 977
+    // Optimize multiply_bigint_by_const with better PTX usage
+    uint32_t H977[9];
     {
-        uint64_t prod = (uint64_t)H.data[0] * 977;
-        uint64_t sum = (uint64_t)Rext[0] + (uint32_t)prod;
-        Rext[0] = (uint32_t)sum;
-        carry = (prod >> 32) + (sum >> 32);
+        uint32_t carry = 0;
+        #pragma unroll
+        for (int i = 0; i < BIGINT_WORDS; i++) {
+            uint32_t lo, hi;
+            asm volatile(
+                "mad.lo.cc.u32 %0, %2, %3, %4;\n\t"  // lo = a*977 + carry (with carry out)
+                "madc.hi.u32 %1, %2, %3, 0;\n\t"     // hi = high(a*977) + carry in
+                : "=r"(lo), "=r"(hi)
+                : "r"(H.data[i]), "r"(977), "r"(carry)
+            );
+            H977[i] = lo;
+            carry = hi;
+        }
+        H977[8] = carry;
     }
     
-    // For i=1 to 7: add H[i] * 977 + H[i-1] (shifted)
-    #pragma unroll
-    for (int i = 1; i < 8; i++) {
-        uint64_t prod = (uint64_t)H.data[i] * 977;
-        uint64_t sum = (uint64_t)Rext[i] + (uint32_t)prod + H.data[i-1] + carry;
-        Rext[i] = (uint32_t)sum;
-        carry = (prod >> 32) + (sum >> 32);
-    }
+    // Use optimized add_9word
+    add_9word(Rext, H977);
     
-    // For i=8: add H[7] (shifted) + carry
-    {
-        uint64_t sum = (uint64_t)Rext[8] + H.data[7] + carry;
-        Rext[8] = (uint32_t)sum;
-        // Any overflow beyond this is handled next
-    }
+    uint32_t Hshift[9] = {0};
+    shift_left_word(&H, Hshift);
+    add_9word(Rext, Hshift);
     
-    // Handle overflow exactly as in original
+    // Keep overflow handling exactly the same
     if (Rext[8]) {
+        uint32_t extra[9] = {0};
         BigInt extraBI;
         init_bigint(&extraBI, Rext[8]);
         Rext[8] = 0;
         
-        // Compute extra977 = extraBI * 977 (optimized for single word)
-        uint64_t prod = (uint64_t)extraBI.data[0] * 977;
-        uint32_t extra977_low = (uint32_t)prod;
-        uint32_t extra977_high = (uint32_t)(prod >> 32);
+        uint32_t extra977[9] = {0}, extraShift[9] = {0};
         
-        // Add extra977 to Rext[0] and Rext[1]
-        uint64_t sum = (uint64_t)Rext[0] + extra977_low;
-        Rext[0] = (uint32_t)sum;
-        carry = (sum >> 32);
-        
-        sum = (uint64_t)Rext[1] + extra977_high + extraBI.data[0] + carry;
-        Rext[1] = (uint32_t)sum;
-        carry = (sum >> 32);
-        
-        // Propagate carry if needed
-        for (int i = 2; i < 9 && carry; i++) {
-            sum = (uint64_t)Rext[i] + carry;
-            Rext[i] = (uint32_t)sum;
-            carry = (sum >> 32);
+        // Optimize: inline small multiply for single word
+        {
+            uint32_t lo, hi;
+            asm volatile(
+                "mul.lo.u32 %0, %2, %3;\n\t"
+                "mul.hi.u32 %1, %2, %3;\n\t"
+                : "=r"(lo), "=r"(hi)
+                : "r"(extraBI.data[0]), "r"(977)
+            );
+            extra977[0] = lo;
+            extra977[1] = hi;
         }
+        
+        shift_left_word(&extraBI, extraShift);
+        
+        #pragma unroll
+        for (int i = 0; i < 9; i++) {
+            extra[i] = extra977[i];
+        }
+        add_9word(extra, extraShift);
+        add_9word(Rext, extra);
     }
     
-    // Convert back to BigInt
+    // Final reduction - exactly the same
     BigInt R_temp;
     #pragma unroll
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < BIGINT_WORDS; i++) {
         R_temp.data[i] = Rext[i];
     }
     
-    // Final reductions - exactly as original
     if (Rext[8] || compare_bigint(&R_temp, &const_p) >= 0) {
         ptx_u256Sub(&R_temp, &R_temp, &const_p);
     }
@@ -265,7 +278,6 @@ __device__ __forceinline__ void mul_mod_device(BigInt *res, const BigInt *a, con
     
     copy_bigint(res, &R_temp);
 }
-
 __device__ __forceinline__ void sub_mod_device(BigInt *res, const BigInt *a, const BigInt *b) {
     BigInt temp;
     if (compare_bigint(a, b) < 0) {
@@ -278,44 +290,61 @@ __device__ __forceinline__ void sub_mod_device(BigInt *res, const BigInt *a, con
     copy_bigint(res, &temp);
 }
 
-__device__ void mod_inverse_fast(BigInt *res, const BigInt *a) {
-    BigInt R0, R1;
-    init_bigint(&R0, 1);
-    copy_bigint(&R1, a);
-    
-    // Process from MSB (bit 255) to LSB (bit 0)
-    // p-2 = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2D
-    
-    // Handle bits 255-33 (all are 1s in p-2)
-    #pragma unroll
-    for (int i = 255; i >= 33; i--) {
-        // bit = 1, so always:
-        mul_mod_device(&R0, &R0, &R1);    // R0 = R0 * R1
-        mul_mod_device(&R1, &R1, &R1);    // R1 = R1^2
+__device__ __forceinline__ void scalar_mod_n(BigInt *res, const BigInt *a) {
+    if (compare_bigint(a, &const_n) >= 0) {
+        ptx_u256Sub(res, a, &const_n);
+    } else {
+        copy_bigint(res, a);
     }
+}
+
+__device__ __forceinline__ void add_mod_device(BigInt *res, const BigInt *a, const BigInt *b) {
+    uint32_t carry;
     
-    // Handle bit 32 (which is 0 in p-2)
-    mul_mod_device(&R1, &R0, &R1);       // R1 = R0 * R1
-    mul_mod_device(&R0, &R0, &R0);       // R0 = R0^2
+    // Use PTX for addition with carry flag
+    asm volatile(
+        "add.cc.u32 %0, %9, %17;\n\t"
+        "addc.cc.u32 %1, %10, %18;\n\t"
+        "addc.cc.u32 %2, %11, %19;\n\t"
+        "addc.cc.u32 %3, %12, %20;\n\t"
+        "addc.cc.u32 %4, %13, %21;\n\t"
+        "addc.cc.u32 %5, %14, %22;\n\t"
+        "addc.cc.u32 %6, %15, %23;\n\t"
+        "addc.cc.u32 %7, %16, %24;\n\t"
+        "addc.u32 %8, 0, 0;\n\t"  // capture final carry
+        : "=r"(res->data[0]), "=r"(res->data[1]), "=r"(res->data[2]), "=r"(res->data[3]),
+          "=r"(res->data[4]), "=r"(res->data[5]), "=r"(res->data[6]), "=r"(res->data[7]),
+          "=r"(carry)
+        : "r"(a->data[0]), "r"(a->data[1]), "r"(a->data[2]), "r"(a->data[3]),
+          "r"(a->data[4]), "r"(a->data[5]), "r"(a->data[6]), "r"(a->data[7]),
+          "r"(b->data[0]), "r"(b->data[1]), "r"(b->data[2]), "r"(b->data[3]),
+          "r"(b->data[4]), "r"(b->data[5]), "r"(b->data[6]), "r"(b->data[7])
+    );
     
-    // Handle bits 31-0 with the correct pattern
-    // The low 32 bits of p-2 are 0xFFFFFC2D
-    // We need to process from bit 31 down to bit 0
-    
-    #pragma unroll 32
-    for (int i = 31; i >= 0; i--) {
-        uint32_t bit = (0xFFFFFC2D >> i) & 1;
-        
-        if (bit == 1) {
-            mul_mod_device(&R0, &R0, &R1);    // R0 = R0 * R1
-            mul_mod_device(&R1, &R1, &R1);    // R1 = R1^2
-        } else {
-            mul_mod_device(&R1, &R0, &R1);    // R1 = R0 * R1
-            mul_mod_device(&R0, &R0, &R0);    // R0 = R0^2
-        }
+    if (carry || compare_bigint(res, &const_p) >= 0) {
+        ptx_u256Sub(res, res, &const_p);
     }
-    
-    copy_bigint(res, &R0);
+}
+
+__device__ void modexp(BigInt *res, const BigInt *base, const BigInt *exp) {
+    BigInt result;
+    init_bigint(&result, 1);
+    BigInt b;
+    copy_bigint(&b, base);
+    for (int i = 0; i < 256; i++) {
+         if (get_bit(exp, i)) {
+              mul_mod_device(&result, &result, &b);
+         }
+         mul_mod_device(&b, &b, &b);
+    }
+    copy_bigint(res, &result);
+}
+
+__device__ void mod_inverse(BigInt *res, const BigInt *a) {
+    BigInt p_minus_2, two;
+    init_bigint(&two, 2);
+    ptx_u256Sub(&p_minus_2, &const_p, &two);
+    modexp(res, a, &p_minus_2);
 }
 
 __device__ __forceinline__ void point_set_infinity_jac(ECPointJac *P) {
@@ -328,9 +357,6 @@ __device__ __forceinline__ void point_copy_jac(ECPointJac *dest, const ECPointJa
     copy_bigint(&dest->Z, &src->Z);
     dest->infinity = src->infinity;
 }
-
-__device__ void double_point_jac(ECPointJac *R, const ECPointJac *P); // 声明
-__device__ void add_point_jac(ECPointJac *R, const ECPointJac *P, const ECPointJac *Q); // 声明
 
 __device__ void double_point_jac(ECPointJac *R, const ECPointJac *P) {
     if (P->infinity || is_zero(&P->Y)) {
@@ -413,7 +439,7 @@ __device__ void add_point_jac(ECPointJac *R, const ECPointJac *P, const ECPointJ
 }
 
 
-__device__ void jacobian_to_affine_fast(ECPoint *R, const ECPointJac *P) {
+__device__ void jacobian_to_affine(ECPoint *R, const ECPointJac *P) {
     if (P->infinity) {
         R->infinity = true;
         init_bigint(&R->x, 0);
@@ -421,7 +447,7 @@ __device__ void jacobian_to_affine_fast(ECPoint *R, const ECPointJac *P) {
         return;
     }
     BigInt Zinv, Zinv2, Zinv3;
-    mod_inverse_fast(&Zinv, &P->Z);  // <-- Use fast inverse here
+    mod_inverse(&Zinv, &P->Z);
     mul_mod_device(&Zinv2, &Zinv, &Zinv);
     mul_mod_device(&Zinv3, &Zinv2, &Zinv);
     mul_mod_device(&R->x, &P->X, &Zinv2);
@@ -430,399 +456,269 @@ __device__ void jacobian_to_affine_fast(ECPoint *R, const ECPointJac *P) {
 }
 
 
-// General scalar multiplication for arbitrary points (using shared memory)
 __device__ void scalar_multiply_jac_device(ECPointJac *result, const ECPointJac *point, const BigInt *scalar) {
-    const int SHARED_WINDOW_SIZE = 4;
-    const int SHARED_PRECOMP_SIZE = 1 << SHARED_WINDOW_SIZE;
-    
-    // Use shared memory for precomputed points
-    __shared__ ECPointJac shared_precomp[1 << SHARED_WINDOW_SIZE];
-    
-    // Collaborative precomputation using threads in the block
-    int tid = threadIdx.x;
-    int block_size = blockDim.x;
-    
-    // Each thread computes some precomputed points
-    for (int i = tid; i < SHARED_PRECOMP_SIZE; i += block_size) {
-        if (i == 0) {
-            point_set_infinity_jac(&shared_precomp[0]);
-        } else if (i == 1) {
-            point_copy_jac(&shared_precomp[1], point);
-        } else {
-            add_point_jac(&shared_precomp[i], &shared_precomp[i-1], point);
+
+    const int NUM_WINDOWS = (BIGINT_WORDS * 32 + WINDOW_SIZE - 1) / WINDOW_SIZE; // ceil(256 / 4) = 64
+
+    ECPointJac res;
+    point_set_infinity_jac(&res);  // Initialize result to point at infinity
+
+    for (int window = NUM_WINDOWS - 1; window >= 0; window--) {
+        // Perform WINDOW_SIZE doublings per window
+        #pragma unroll
+        for (int j = 0; j < WINDOW_SIZE; j++) {
+            double_point_jac(&res, &res);
+        }
+
+        // Extract window bits
+        int bit_index = window * WINDOW_SIZE;
+        int word_idx = bit_index >> 5;        // bit_index / 32
+        int bit_offset = bit_index & 31;      // bit_index % 32
+
+        int window_value = 0;
+        if (word_idx < BIGINT_WORDS) {
+            if (bit_offset + WINDOW_SIZE <= 32) {
+                // All bits in one word
+                window_value = (scalar->data[word_idx] >> bit_offset) & ((1U << WINDOW_SIZE) - 1);
+            } else {
+                // Bits span two words
+                int bits_in_first = 32 - bit_offset;
+                int bits_in_second = WINDOW_SIZE - bits_in_first;
+
+                uint32_t part1 = scalar->data[word_idx] >> bit_offset;
+                uint32_t part2 = 0;
+                if (word_idx + 1 < BIGINT_WORDS) {
+                    part2 = scalar->data[word_idx + 1] & ((1U << bits_in_second) - 1);
+                }
+                window_value = (part2 << bits_in_first) | part1;
+            }
+        }
+
+        // Add from precomputed table if window_value is non-zero
+        if (window_value > 0) {
+            add_point_jac(&res, &res, &G_precomp[window_value]);
         }
     }
+
+    point_copy_jac(result, &res);
+}
+
+
+__global__ void precompute_G_kernel() {
+    if (threadIdx.x == 0) {
+        point_set_infinity_jac(&G_precomp[0]);
+        point_copy_jac(&G_precomp[1], &const_G_jacobian);
+        for (int i = 2; i < (1 << WINDOW_SIZE); i++) {
+            add_point_jac(&G_precomp[i], &G_precomp[i-1], &const_G_jacobian);
+        }
+    }
+}
+
+// Optimized kernel for generating consecutive public keys
+// Given a base private key k, generates public keys for k, k+1, k+2, ..., k+n-1
+__global__ void generate_consecutive_keys(
+    ECPoint *public_keys,       // Output: array of public keys
+    BigInt *base_private_key,   // Input: starting private key
+    int num_keys)              // Number of consecutive keys to generate
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_keys) return;
     
-    // Ensure all threads have finished precomputation
+    // Calculate private_key = base_private_key + idx
+    BigInt private_key;
+    copy_bigint(&private_key, base_private_key);
+    
+    // Add the offset (idx) to base private key
+    BigInt offset;
+    init_bigint(&offset, idx);
+    
+    // Add offset and wrap around n if necessary
+    BigInt temp;
+    ptx_u256Add(&temp, &private_key, &offset);
+    scalar_mod_n(&private_key, &temp);
+    
+    // Generate public key = private_key × G
+    ECPointJac result_jac;
+    scalar_multiply_jac_device(&result_jac, &const_G_jacobian, &private_key);
+    
+    // Convert to affine coordinates
+    jacobian_to_affine(&public_keys[idx], &result_jac);
+}
+
+// More efficient method using incremental point addition
+// This is MUCH faster for consecutive keys!
+__global__ void generate_consecutive_keys_incremental(
+    ECPoint *public_keys,       // Output: array of public keys
+    BigInt *base_private_key,   // Input: starting private key
+    int stride,                 // Increment between keys (e.g., 1, 1024, etc.)
+    int num_keys,              // Number of keys to generate
+    int keys_per_thread)       // How many keys each thread computes
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_threads = blockDim.x * gridDim.x;
+    
+    if (tid >= total_threads) return;
+    
+    // Each thread handles a chunk of consecutive keys
+    int start_idx = tid * keys_per_thread;
+    int end_idx = min(start_idx + keys_per_thread, num_keys);
+    
+    if (start_idx >= num_keys) return;
+    
+    // Calculate this thread's starting private key
+    BigInt thread_private_key;
+    copy_bigint(&thread_private_key, base_private_key);
+    
+    // Add (start_idx * stride) to get this thread's starting point
+    BigInt offset;
+    init_bigint(&offset, 0);
+    
+    // Calculate start_idx * stride (simple method for small strides)
+    for (int i = 0; i < start_idx; i++) {
+        BigInt stride_bigint;
+        init_bigint(&stride_bigint, stride);
+        BigInt temp;
+        ptx_u256Add(&temp, &offset, &stride_bigint);
+        scalar_mod_n(&offset, &temp);
+    }
+    
+    BigInt temp;
+    ptx_u256Add(&temp, &thread_private_key, &offset);
+    scalar_mod_n(&thread_private_key, &temp);
+    
+    // Compute the first public key for this thread
+    ECPointJac current_pubkey_jac;
+    scalar_multiply_jac_device(&current_pubkey_jac, &const_G_jacobian, &thread_private_key);
+    
+    // Precompute stride*G for incremental addition
+    BigInt stride_bigint;
+    init_bigint(&stride_bigint, stride);
+    ECPointJac stride_G_jac;
+    scalar_multiply_jac_device(&stride_G_jac, &const_G_jacobian, &stride_bigint);
+    
+    // Generate consecutive keys by adding stride*G repeatedly
+    for (int i = start_idx; i < end_idx; i++) {
+        if (i > start_idx) {
+            // Add stride*G to get next public key
+            add_point_jac(&current_pubkey_jac, &current_pubkey_jac, &stride_G_jac);
+        }
+        
+        // Convert to affine and store
+        jacobian_to_affine(&public_keys[i], &current_pubkey_jac);
+    }
+}
+
+// Advanced: Baby-step Giant-step approach for large consecutive ranges
+__global__ void generate_consecutive_keys_baby_giant(
+    ECPoint *public_keys,
+    BigInt *base_private_key,
+    int num_keys)
+{
+    // Shared memory for caching intermediate points
+    __shared__ ECPointJac shared_giant_steps[16];
+    
+    int tid = threadIdx.x;
+    int bid = blockIdx.x;
+    int giant_step_size = 256;  // Each giant step = 256 keys
+    
+    // Phase 1: Compute giant steps (block-level cooperation)
+    if (tid < 16) {
+        BigInt giant_offset;
+        init_bigint(&giant_offset, tid * giant_step_size);
+        
+        BigInt giant_private;
+        ptx_u256Add(&giant_private, base_private_key, &giant_offset);
+        scalar_mod_n(&giant_private, &giant_private);
+        
+        scalar_multiply_jac_device(&shared_giant_steps[tid], 
+                                  &const_G_jacobian, &giant_private);
+    }
     __syncthreads();
     
-    // Find the highest non-zero bit
-    int highest_bit = BIGINT_WORDS * 32 - 1;
-    for (; highest_bit >= 0; highest_bit--) {
-        if (get_bit(scalar, highest_bit)) break;
-    }
+    // Phase 2: Each thread computes its keys using baby steps
+    int keys_per_thread = 4;
+    int thread_start = bid * blockDim.x * keys_per_thread + tid * keys_per_thread;
     
-    if (highest_bit < 0) {
-        point_set_infinity_jac(result);
-        return;
-    }
+    if (thread_start >= num_keys) return;
     
-    // Initialize result
-    ECPointJac res;
-    point_set_infinity_jac(&res);
+    // Determine which giant step to use
+    int giant_idx = thread_start / giant_step_size;
+    int baby_start = thread_start % giant_step_size;
     
-    // Process scalar in windows of SHARED_WINDOW_SIZE bits
-    int i = highest_bit;
-    while (i >= 0) {
-        // Determine window size for this iteration
-        int window_bits = (i >= SHARED_WINDOW_SIZE - 1) ? SHARED_WINDOW_SIZE : (i + 1);
-        
-        // Double 'window_bits' times
-        for (int j = 0; j < window_bits; j++) {
-            double_point_jac(&res, &res);
-        }
-        
-        // Extract window value
-        int window_value = 0;
-        for (int j = 0; j < window_bits; j++) {
-            if (i - j >= 0 && get_bit(scalar, i - j)) {
-                window_value |= (1 << (window_bits - 1 - j));
-            }
-        }
-        
-        // Add precomputed point if window value is non-zero
-        if (window_value > 0) {
-            add_point_jac(&res, &res, &shared_precomp[window_value]);
-        }
-        
-        i -= window_bits;
-    }
-    
-    point_copy_jac(result, &res);
-}
-
-// Helper function to check if a point equals the base point G
-__device__ bool is_base_point_G(const ECPointJac *point) {
-    return (compare_bigint(&point->X, &const_G_jacobian.X) == 0 &&
-            compare_bigint(&point->Y, &const_G_jacobian.Y) == 0 &&
-            compare_bigint(&point->Z, &const_G_jacobian.Z) == 0 &&
-            point->infinity == const_G_jacobian.infinity);
-}
-
-// Modified scalar multiplication to use global memory
-__device__ void scalar_multiply_G_precomputed_large(ECPointJac *result, const BigInt *scalar) {
-    ECPointJac res;
-    point_set_infinity_jac(&res);
-    
-    // Process from highest bit to lowest in PRECOMP_BITS chunks
-    for (int i = 256 - PRECOMP_BITS; i >= 0; i -= PRECOMP_BITS) {
-        // Double for the window size
-        for (int j = 0; j < PRECOMP_BITS; j++) {
-            double_point_jac(&res, &res);
-        }
-        
-        // Extract window value correctly (big-endian style)
-        uint32_t window = 0;
-        for (int j = PRECOMP_BITS - 1; j >= 0; j--) {
-            window <<= 1;
-            if (i + j < 256 && get_bit(scalar, i + j)) {
-                window |= 1;
-            }
-        }
-        
-        // Add precomputed point
-        if (window > 0) {
-            add_point_jac(&res, &res, &d_precomp_G[window]);
-        }
-    }
-    
-    point_copy_jac(result, &res);
-}
-
-// Cleanup function (call at program end)
-void cleanup_precomputed_table() {
-    ECPointJac *h_precomp_G_ptr;
-    CHECK_CUDA(cudaMemcpyFromSymbol(&h_precomp_G_ptr, d_precomp_G, sizeof(ECPointJac*)));
-    CHECK_CUDA(cudaFree(h_precomp_G_ptr));
-}
-// Main scalar multiplication function that automatically chooses optimal method
-__device__ void scalar_multiply_optimized(ECPointJac *result, const ECPointJac *point, const BigInt *scalar) {
-    if (is_base_point_G(point)) {
-        // Use precomputed table for base point G
-        scalar_multiply_G_precomputed_large(result, scalar);
+    // Start from the appropriate giant step
+    ECPointJac current_point;
+    if (giant_idx < 16) {
+        point_copy_jac(&current_point, &shared_giant_steps[giant_idx]);
     } else {
-        // Use general method with shared memory
-		printf("manual scalar");
-        scalar_multiply_jac_device(result, point, scalar);
-    }
-}
-
-#endif
-
-// Host function implementations (should be in a separate .cu file)
-
-// Host-side BigInt and ECPoint operations (simplified versions)
-void host_init_bigint(BigInt *x, uint32_t val) {
-    x->data[0] = val;
-    for (int i = 1; i < BIGINT_WORDS; i++) x->data[i] = 0;
-}
-
-void host_copy_bigint(BigInt *dest, const BigInt *src) {
-    for (int i = 0; i < BIGINT_WORDS; i++) {
-        dest->data[i] = src->data[i];
-    }
-}
-
-void host_point_set_infinity_jac(ECPointJac *P) {
-    P->infinity = true;
-}
-
-void host_point_copy_jac(ECPointJac *dest, const ECPointJac *src) {
-    host_copy_bigint(&dest->X, &src->X);
-    host_copy_bigint(&dest->Y, &src->Y);
-    host_copy_bigint(&dest->Z, &src->Z);
-    dest->infinity = src->infinity;
-}
-
-// Host-side point addition and doubling (you can use your existing CPU implementations)
-// These are simplified placeholders - replace with your actual host implementations
-void host_add_point_jac(ECPointJac *R, const ECPointJac *P, const ECPointJac *Q) {
-    // TODO: Implement host-side point addition
-    // This should be equivalent to your device add_point_jac function
-    // but using host-side modular arithmetic
-}
-
-void host_double_point_jac(ECPointJac *R, const ECPointJac *P) {
-    // TODO: Implement host-side point doubling
-    // This should be equivalent to your device double_point_jac function
-    // but using host-side modular arithmetic
-}
-
-// GPU kernel to compute precomputed table
-__global__ void compute_precomputed_table_gpu(ECPointJac *temp_table) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= PRECOMP_SIZE) return;
-    
-    if (idx == 0) {
-        // table[0] = infinity (0*G)
-        point_set_infinity_jac(&temp_table[0]);
-        return;
+        // Compute if beyond cached range
+        BigInt offset;
+        init_bigint(&offset, giant_idx * giant_step_size);
+        BigInt private_key;
+        ptx_u256Add(&private_key, base_private_key, &offset);
+        scalar_mod_n(&private_key, &private_key);
+        scalar_multiply_jac_device(&current_point, &const_G_jacobian, &private_key);
     }
     
-    // Each thread computes idx*G using binary representation
-    ECPointJac result, base;
-    point_set_infinity_jac(&result);
-    point_copy_jac(&base, &const_G_jacobian);
+    // Add baby steps to reach exact starting position
+    if (baby_start > 0) {
+        BigInt baby_offset;
+        init_bigint(&baby_offset, baby_start);
+        ECPointJac baby_step;
+        scalar_multiply_jac_device(&baby_step, &const_G_jacobian, &baby_offset);
+        add_point_jac(&current_point, &current_point, &baby_step);
+    }
     
-    int temp_idx = idx;
-    while (temp_idx > 0) {
-        if (temp_idx & 1) {
-            add_point_jac(&result, &result, &base);
+    // Generate consecutive keys for this thread
+    for (int i = 0; i < keys_per_thread && (thread_start + i) < num_keys; i++) {
+        if (i > 0) {
+            // Add G for next consecutive key
+            add_point_jac(&current_point, &current_point, &const_G_jacobian);
         }
-        double_point_jac(&base, &base);
-        temp_idx >>= 1;
-    }
-    
-    point_copy_jac(&temp_table[idx], &result);
-}
-
-// New kernel for batch computation
-__global__ void compute_batch_precomp(ECPointJac *batch, int start_idx, int count) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= count) return;
-    
-    if (idx == 0 && start_idx == 2) {
-        // First point in first batch: 2*G = G + G
-        add_point_jac(&batch[1], &batch[0], &const_G_jacobian);
-    } else if (idx > 0) {
-        // Each subsequent point: (start_idx + idx)*G = (start_idx + idx - 1)*G + G
-        add_point_jac(&batch[idx], &batch[idx - 1], &const_G_jacobian);
+        jacobian_to_affine(&public_keys[thread_start + i], &current_point);
     }
 }
 
-
-// Alternative: More robust kernel that processes in smaller chunks
-__global__ void compute_batch_precomp_kernel_robust(ECPointJac *table, int start_idx, int end_idx) {
-    // Process in chunks of 64 to avoid timeouts
-    const int CHUNK_SIZE = 64;
+// Host function for consecutive key generation with stride
+void generate_consecutive_keys_host(
+    ECPoint *h_public_keys,     // Output public keys
+    BigInt *h_base_private_key, // Starting private key
+    int stride,                 // Increment (1 for consecutive, 1024 for every 1024th, etc.)
+    int num_keys)              // Total number of keys
+{
+    ECPoint *d_public_keys;
+    BigInt *d_base_private_key;
     
-    for (int chunk_start = start_idx; chunk_start < end_idx; chunk_start += CHUNK_SIZE) {
-        int chunk_end = min(chunk_start + CHUNK_SIZE, end_idx);
-        
-        // Compute this chunk
-        for (int i = chunk_start; i < chunk_end; i++) {
-            add_point_jac(&table[i], &table[i - 1], &const_G_jacobian);
-        }
-        
-        // Allow other kernels to run (prevent timeout)
-        __syncthreads();
-    }
-}
-void init_precomputed_table_host() {
-    printf("Initializing precomputed table for base point G...\n");
-    printf("Table size: %d entries (%.2f MB)\n", PRECOMP_SIZE, 
-           (PRECOMP_SIZE * sizeof(ECPointJac)) / (1024.0 * 1024.0));
+    cudaMalloc(&d_public_keys, num_keys * sizeof(ECPoint));
+    cudaMalloc(&d_base_private_key, sizeof(BigInt));
     
-    // Allocate global memory for the table
-    ECPointJac *h_precomp_G_ptr;
-    CHECK_CUDA(cudaMalloc(&h_precomp_G_ptr, PRECOMP_SIZE * sizeof(ECPointJac)));
+    cudaMemcpy(d_base_private_key, h_base_private_key, 
+               sizeof(BigInt), cudaMemcpyHostToDevice);
     
-    // Copy the pointer to device symbol
-    CHECK_CUDA(cudaMemcpyToSymbol(d_precomp_G, &h_precomp_G_ptr, sizeof(ECPointJac*)));
+    // Precompute G table
+    precompute_G_kernel<<<1, 1>>>();
+    cudaDeviceSynchronize();
     
-    // Compute table on GPU using simple sequential approach
-    ECPointJac *h_table = (ECPointJac*)malloc(PRECOMP_SIZE * sizeof(ECPointJac));
-    
-    // Initialize ALL entries to infinity first (for safety)
-    for (int i = 0; i < PRECOMP_SIZE; i++) {
-        host_point_set_infinity_jac(&h_table[i]);
-    }
-    
-    // Set up first two entries
-    ECPointJac G_host;
-    cudaMemcpyFromSymbol(&G_host, const_G_jacobian, sizeof(ECPointJac));
-    host_point_copy_jac(&h_table[1], &G_host);
-    
-    // Copy initial entries to GPU
-    CHECK_CUDA(cudaMemcpy(h_precomp_G_ptr, h_table, 2 * sizeof(ECPointJac), cudaMemcpyHostToDevice));
-    
-    // Compute remaining entries in batches
-    const int BATCH_SIZE = (PRECOMP_SIZE > 16384) ? 256 : 1024;  // Smaller batches for large tables
-    int total_computed = 2;  // Track actual progress
-    
-    for (int i = 2; i < PRECOMP_SIZE; i += BATCH_SIZE) {
-        int batch_end = min(i + BATCH_SIZE, PRECOMP_SIZE);
-        int batch_size = batch_end - i;
+    if (num_keys < 10000) {
+        // For small batches, use simple parallel approach
+        int threadsPerBlock = 256;
+        int numBlocks = (num_keys + threadsPerBlock - 1) / threadsPerBlock;
         
-        printf("Processing batch: %d to %d (size: %d)\n", i, batch_end, batch_size);
+        generate_consecutive_keys<<<numBlocks, threadsPerBlock>>>(
+            d_public_keys, d_base_private_key, num_keys);
+    } else {
+        // For large batches, use incremental approach
+        int threadsPerBlock = 256;
+        int keys_per_thread = 16;  // Each thread handles 16 consecutive keys
+        int total_threads = (num_keys + keys_per_thread - 1) / keys_per_thread;
+        int numBlocks = (total_threads + threadsPerBlock - 1) / threadsPerBlock;
         
-        // Copy current state to GPU if needed
-        if (i > 2) {
-            CHECK_CUDA(cudaMemcpy(&h_precomp_G_ptr[i-1], &h_table[i-1], 
-                                 sizeof(ECPointJac), cudaMemcpyHostToDevice));
-        }
-        
-        // Compute batch on GPU
-        compute_batch_precomp_kernel_robust<<<1, 1>>>(h_precomp_G_ptr, i, batch_end);
-        
-        // Check for errors
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            printf("Kernel launch error: %s\n", cudaGetErrorString(err));
-            exit(1);
-        }
-        
-        CHECK_CUDA(cudaDeviceSynchronize());
-        
-        // Copy results back
-        CHECK_CUDA(cudaMemcpy(&h_table[i], &h_precomp_G_ptr[i], 
-                             batch_size * sizeof(ECPointJac), cudaMemcpyDeviceToHost));
-        
-        // Verify batch was actually computed
-        bool batch_valid = true;
-        for (int j = i; j < batch_end && batch_valid; j++) {
-            if (h_table[j].infinity) {
-                printf("ERROR: Entry %d is still infinity after computation!\n", j);
-                batch_valid = false;
-            }
-        }
-        
-        if (!batch_valid) {
-            printf("Batch computation failed at entry %d\n", i);
-            total_computed = i;
-            break;
-        }
-        
-        total_computed = batch_end;
-        
-        //if (i % 1024 == 0 || i == 2) {
-            printf("Computed %d entries (%.1f%%)\n", total_computed, 
-                   100.0 * total_computed / PRECOMP_SIZE);
-        //}
+        generate_consecutive_keys_incremental<<<numBlocks, threadsPerBlock>>>(
+            d_public_keys, d_base_private_key, stride, num_keys, keys_per_thread);
     }
     
-    printf("\nActual entries computed: %d out of %d\n", total_computed, PRECOMP_SIZE);
+    cudaMemcpy(h_public_keys, d_public_keys, 
+               num_keys * sizeof(ECPoint), cudaMemcpyDeviceToHost);
     
-    if (total_computed < PRECOMP_SIZE) {
-        printf("ERROR: Table incomplete! Only computed %d entries (%.1f%%)\n", 
-               total_computed, 100.0 * total_computed / PRECOMP_SIZE);
-        printf("Reducing PRECOMP_BITS is recommended.\n");
-        exit(1);
-    }
-    
-    // Copy final table to GPU
-    CHECK_CUDA(cudaMemcpy(h_precomp_G_ptr, h_table, PRECOMP_SIZE * sizeof(ECPointJac), 
-                         cudaMemcpyHostToDevice));
-    
-    free(h_table);
-    printf("Precomputed table initialized successfully in global memory\n");
+    cudaFree(d_public_keys);
+    cudaFree(d_base_private_key);
 }
-
-// Utility function to initialize secp256k1 constants
-void init_secp256k1_constants() {
-    // secp256k1 prime p = 2^256 - 2^32 - 977
-    BigInt p;
-    uint32_t p_data[8] = {
-        0xFFFFFC2F, 0xFFFFFFFE, 0xFFFFFFFF, 0xFFFFFFFF,
-        0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF
-    };
-    memcpy(p.data, p_data, sizeof(p_data));
-    cudaMemcpyToSymbol(const_p, &p, sizeof(BigInt));
-    
-    // secp256k1 order n
-    BigInt n;
-    uint32_t n_data[8] = {
-        0xD0364141, 0xBFD25E8C, 0xAF48A03B, 0xBAAEDCE6,
-        0xFFFFFFFE, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF
-    };
-    memcpy(n.data, n_data, sizeof(n_data));
-    cudaMemcpyToSymbol(const_n, &n, sizeof(BigInt));
-    
-    // secp256k1 base point G in Jacobian coordinates
-    ECPointJac G_jac;
-    uint32_t Gx_data[8] = {
-        0x16F81798, 0x59F2815B, 0x2DCE28D9, 0x029BFCDB,
-        0xCE870B07, 0x55A06295, 0xF9DCBBAC, 0x79BE667E
-    };
-    uint32_t Gy_data[8] = {
-        0xFB10D4B8, 0x9C47D08F, 0xA6855419, 0xFD17B448,
-        0x0E1108A8, 0x5DA4FBFC, 0x26A3C465, 0x483ADA77
-    };
-    memcpy(G_jac.X.data, Gx_data, sizeof(Gx_data));
-    memcpy(G_jac.Y.data, Gy_data, sizeof(Gy_data));
-    host_init_bigint(&G_jac.Z, 1);
-    G_jac.infinity = false;
-    
-    cudaMemcpyToSymbol(const_G_jacobian, &G_jac, sizeof(ECPointJac));
-    
-    printf("secp256k1 constants initialized on GPU\n");
-}
-
-// Complete initialization function to call from main
-void initialize_secp256k1_gpu() {
-    printf("Initializing secp256k1 for GPU...\n");
-    
-    // Initialize constants first
-    init_secp256k1_constants();
-    
-    // Then initialize precomputed table
-    init_precomputed_table_host();
-    
-    printf("secp256k1 GPU initialization complete!\n");
-}
-
-// Example usage kernel
-__global__ void test_scalar_multiplication(ECPoint *results, BigInt *scalars, int count) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= count) return;
-    
-    ECPointJac result_jac;
-    
-    // Use optimized scalar multiplication (automatically chooses best method)
-    scalar_multiply_optimized(&result_jac, &const_G_jacobian, &scalars[idx]);
-    
-    // Convert to affine coordinates for output
-    jacobian_to_affine_fast(&results[idx], &result_jac);
-}
-
-//Author telegram: https://t.me/nmn5436
